@@ -1,0 +1,247 @@
+name: Build Android APK
+
+# Works in three situations, no setup needed:
+# 1. The repository holds only a project .zip (upload the zip as a single file) <- easiest
+# 2. The repository holds the project as normal files and folders
+# 3. You press "Run workflow" by hand on the Actions tab
+#
+# If several .zip files are in the repository, the most recently uploaded one that
+# contains an Android/Gradle project (settings.gradle or settings.gradle.kts) is built.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+# A newer push cancels an older unfinished build of the same branch.
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+# "write" is only needed to publish the APK on the Releases page.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find the project (zip file or plain folder)
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="$GITHUB_WORKSPACE/_project"
+          rm -rf "$DEST"
+
+          # Prints the shallowest settings.gradle(.kts) found under $1 (nothing if none).
+          find_settings() {
+            find "$1" -maxdepth 6 \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+              -not -path '*/__MACOSX/*' -not -path '*/.git/*' -not -path '*/build/*' \
+              -print 2>/dev/null \
+              | awk -F/ '{ print NF "\t" $0 }' | sort -n | sed -n '1p' | cut -f2-
+          }
+
+          # 1) Zip files tracked in the repository, newest upload first.
+          LIST="$(mktemp)"
+          git -c core.quotepath=false ls-files | { grep -i '\.zip$' || true; } | while IFS= read -r f; do
+            ts="$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)"
+            printf '%s\t%s\n' "${ts:-0}" "$f"
+          done | sort -t "$(printf '\t')" -k1,1nr -k2,2r > "$LIST"
+
+          USED=""
+          while IFS="$(printf '\t')" read -r ts zip; do
+            [ -n "$zip" ] || continue
+            # Only zips that really contain a Gradle project count.
+            # (No "grep -q" here: it closes the pipe early and "pipefail" would then call it a failure.)
+            if unzip -l "$zip" 2>/dev/null | grep -E '(^|[ /])settings\.gradle(\.kts)?$' > /dev/null; then
+              echo "Using zip file: $zip"
+              mkdir -p "$DEST"
+              rc=0
+              # unzip exit code 1 only means "warnings" (for example Windows-style paths) - that is fine.
+              unzip -q -o "$zip" -d "$DEST" || rc=$?
+              if [ "$rc" -gt 1 ]; then
+                echo "::error::The zip file '$zip' could not be unpacked (unzip code $rc). Re-create the zip and upload it again."
+                exit 1
+              fi
+              rm -rf "$DEST/__MACOSX"
+              USED="$zip"
+              SEARCH_IN="$DEST"
+              break
+            else
+              echo "Skipping '$zip': it contains no settings.gradle or settings.gradle.kts."
+            fi
+          done < "$LIST"
+
+          # 2) No usable zip: look for an ordinary project in the repository itself.
+          if [ -z "$USED" ]; then
+            echo "No project zip found; looking for a project stored as normal files."
+            SEARCH_IN="$GITHUB_WORKSPACE"
+          fi
+
+          SETTINGS="$(find_settings "$SEARCH_IN" || true)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error title=No Android project found::Upload the project .zip file (it must contain settings.gradle.kts and an app folder) to the repository, or upload the project files themselves."
+            {
+              echo "### No Android project found"
+              echo "Upload the project **.zip** file to this repository (the zip must contain \`settings.gradle.kts\` and the \`app\` folder), then run again."
+              echo
+              echo "Files seen in the repository:"
+              echo '```'
+              { git -c core.quotepath=false ls-files | head -n 40; } || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "Project folder: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Project"
+            if [ -n "$USED" ]; then echo "Built from zip file: \`$USED\`"; else echo "Built from the files stored in the repository."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Top level of the project:"
+          ls -la "$PROJECT_DIR"
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::warning::There is no 'app' folder next to $SETTINGS. If the build fails, check that the zip was created from the project folder."
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # GitHub's Ubuntu runners already contain the Android SDK. (The separate "setup-android"
+      # action is not used: its default package list contains the retired package "tools" and
+      # fails with "Failed to find package 'tools'".)
+      - name: Prepare the Android SDK (platform 36)
+        shell: bash
+        run: |
+          set -uo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "Android SDK folder: $SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          SDKM="$(command -v sdkmanager || true)"
+          if [ -z "$SDKM" ]; then
+            SDKM="$(find "$SDK/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | sort | tail -n 1 || true)"
+          fi
+
+          if [ -z "$SDKM" ]; then
+            echo "::warning::sdkmanager was not found; Gradle will try to download the Android platform itself."
+            exit 0
+          fi
+
+          echo "Using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platforms;android-36" "build-tools;35.0.0" \
+            || echo "::warning::Could not preinstall the platform; Gradle will try to download it."
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      # The APK is built first, so a failing unit test can never block it.
+      - name: Build the debug APK
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          # "tee" keeps a copy of the log so the real error can be shown in the summary if the build fails.
+          gradle --no-daemon --stacktrace --console=plain assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      # If the build failed: put the actual compiler/Gradle errors at the top of the run page
+      # and keep the full log, so the problem can be copied or sent without digging through the log.
+      - name: Show the build errors
+        if: failure()
+        shell: bash
+        run: |
+          [ -f build.log ] || exit 0
+          {
+            echo "### Build failed - the important lines"
+            echo '```'
+            { grep -E '^e: |^e\] |error:|\* What went wrong|Execution failed|Could not resolve|FAILED' -A2 build.log | head -n 80; } || true
+            echo '```'
+            echo "The full log is attached to this run as **build-log**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the full build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Collect the APK
+        id: apk
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/apk-out"
+          FOUND="$(find . -path '*/build/outputs/apk/debug/*.apk' -not -name '*androidTest*' | sort | sed -n '1p')"
+          if [ -z "$FOUND" ]; then
+            echo "::error::The build finished but no debug APK was produced."
+            exit 1
+          fi
+          cp "$FOUND" "$GITHUB_WORKSPACE/apk-out/PDFMaster-debug.apk"
+          SIZE="$(du -h "$GITHUB_WORKSPACE/apk-out/PDFMaster-debug.apk" | cut -f1)"
+          echo "APK ready: $FOUND ($SIZE)"
+          {
+            echo "### APK ready"
+            echo "Size: $SIZE"
+            echo "Download it from **Artifacts** at the bottom of this page, or from the **Releases** page of the repository (easier on a phone)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDFMaster-debug-apk
+          path: apk-out/PDFMaster-debug.apk
+          if-no-files-found: error
+
+      # A Release gives a direct .apk download link (no zip to unpack), handy on a phone.
+      - name: Publish the APK on the Releases page
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="apk-latest"
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes >/dev/null 2>&1 || true
+          gh release create "$TAG" "apk-out/PDFMaster-debug.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Latest debug APK" \
+            --notes "Built automatically from commit ${GITHUB_SHA::7}. Download PDFMaster-debug.apk and open it on your phone."
+
+      # Tests run last and never block the APK; their report is uploaded either way.
+      - name: Run unit tests
+        continue-on-error: true
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: gradle --no-daemon --stacktrace --console=plain testDebugUnitTest
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            **/build/reports/tests/
+            **/build/test-results/
+          if-no-files-found: ignore
